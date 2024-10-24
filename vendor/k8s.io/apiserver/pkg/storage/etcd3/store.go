@@ -38,9 +38,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/apiserver/pkg/audit"
+	"k8s.io/apiserver/pkg/features"
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/etcd3/metrics"
+	etcdfeature "k8s.io/apiserver/pkg/storage/feature"
 	"k8s.io/apiserver/pkg/storage/value"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/component-base/tracing"
 	"k8s.io/klog/v2"
 )
@@ -78,6 +81,7 @@ type store struct {
 	groupResourceString string
 	watcher             *watcher
 	leaseManager        *leaseManager
+	decoder             Decoder
 }
 
 func (s *store) RequestWatchProgress(ctx context.Context) error {
@@ -95,12 +99,11 @@ type objState struct {
 }
 
 // New returns an etcd3 implementation of storage.Interface.
-func New(c *clientv3.Client, codec runtime.Codec, newFunc, newListFunc func() runtime.Object, prefix, resourcePrefix string, groupResource schema.GroupResource, transformer value.Transformer, leaseManagerConfig LeaseManagerConfig) storage.Interface {
-	return newStore(c, codec, newFunc, newListFunc, prefix, resourcePrefix, groupResource, transformer, leaseManagerConfig)
+func New(c *clientv3.Client, codec runtime.Codec, newFunc, newListFunc func() runtime.Object, prefix, resourcePrefix string, groupResource schema.GroupResource, transformer value.Transformer, leaseManagerConfig LeaseManagerConfig, decoder Decoder, versioner storage.Versioner) storage.Interface {
+	return newStore(c, codec, newFunc, newListFunc, prefix, resourcePrefix, groupResource, transformer, leaseManagerConfig, decoder, versioner)
 }
 
-func newStore(c *clientv3.Client, codec runtime.Codec, newFunc, newListFunc func() runtime.Object, prefix, resourcePrefix string, groupResource schema.GroupResource, transformer value.Transformer, leaseManagerConfig LeaseManagerConfig) *store {
-	versioner := storage.APIObjectVersioner{}
+func newStore(c *clientv3.Client, codec runtime.Codec, newFunc, newListFunc func() runtime.Object, prefix, resourcePrefix string, groupResource schema.GroupResource, transformer value.Transformer, leaseManagerConfig LeaseManagerConfig, decoder Decoder, versioner storage.Versioner) *store {
 	// for compatibility with etcd2 impl.
 	// no-op for default prefix of '/registry'.
 	// keeps compatibility with etcd2 impl for custom prefixes that don't start with '/'
@@ -133,10 +136,14 @@ func newStore(c *clientv3.Client, codec runtime.Codec, newFunc, newListFunc func
 		groupResourceString: groupResource.String(),
 		watcher:             w,
 		leaseManager:        newDefaultLeaseManager(c, leaseManagerConfig),
+		decoder:             decoder,
 	}
 
 	w.getCurrentStorageRV = func(ctx context.Context) (uint64, error) {
 		return storage.GetCurrentResourceVersionFromStorage(ctx, s, newListFunc, resourcePrefix, w.objectType)
+	}
+	if utilfeature.DefaultFeatureGate.Enabled(features.ConsistentListFromCache) || utilfeature.DefaultFeatureGate.Enabled(features.WatchList) {
+		etcdfeature.DefaultFeatureSupportChecker.CheckClient(c.Ctx(), c, storage.RequestWatchProgress)
 	}
 	return s
 }
@@ -172,10 +179,10 @@ func (s *store) Get(ctx context.Context, key string, opts storage.GetOptions, ou
 
 	data, _, err := s.transformer.TransformFromStorage(ctx, kv.Value, authenticatedDataString(preparedKey))
 	if err != nil {
-		return storage.NewInternalError(err.Error())
+		return storage.NewInternalError(err)
 	}
 
-	err = decode(s.codec, s.versioner, data, out, kv.ModRevision)
+	err = s.decoder.Decode(data, out, kv.ModRevision)
 	if err != nil {
 		recordDecodeError(s.groupResourceString, preparedKey)
 		return err
@@ -218,7 +225,7 @@ func (s *store) Create(ctx context.Context, key string, obj, out runtime.Object,
 	newData, err := s.transformer.TransformToStorage(ctx, data, authenticatedDataString(preparedKey))
 	if err != nil {
 		span.AddEvent("TransformToStorage failed", attribute.String("err", err.Error()))
-		return storage.NewInternalError(err.Error())
+		return storage.NewInternalError(err)
 	}
 	span.AddEvent("TransformToStorage succeeded")
 
@@ -241,7 +248,7 @@ func (s *store) Create(ctx context.Context, key string, obj, out runtime.Object,
 
 	if out != nil {
 		putResp := txnResp.Responses[0].GetResponsePut()
-		err = decode(s.codec, s.versioner, data, out, putResp.Header.Revision)
+		err = s.decoder.Decode(data, out, putResp.Header.Revision)
 		if err != nil {
 			span.AddEvent("decode failed", attribute.Int("len", len(data)), attribute.String("err", err.Error()))
 			recordDecodeError(s.groupResourceString, preparedKey)
@@ -255,7 +262,7 @@ func (s *store) Create(ctx context.Context, key string, obj, out runtime.Object,
 // Delete implements storage.Interface.Delete.
 func (s *store) Delete(
 	ctx context.Context, key string, out runtime.Object, preconditions *storage.Preconditions,
-	validateDeletion storage.ValidateObjectFunc, cachedExistingObject runtime.Object) error {
+	validateDeletion storage.ValidateObjectFunc, cachedExistingObject runtime.Object, opts storage.DeleteOptions) error {
 	preparedKey, err := s.prepareKey(key)
 	if err != nil {
 		return err
@@ -264,13 +271,15 @@ func (s *store) Delete(
 	if err != nil {
 		return fmt.Errorf("unable to convert output object to pointer: %v", err)
 	}
-	return s.conditionalDelete(ctx, preparedKey, out, v, preconditions, validateDeletion, cachedExistingObject)
+
+	skipTransformDecode := false
+	return s.conditionalDelete(ctx, preparedKey, out, v, preconditions, validateDeletion, cachedExistingObject, skipTransformDecode)
 }
 
 func (s *store) conditionalDelete(
 	ctx context.Context, key string, out runtime.Object, v reflect.Value, preconditions *storage.Preconditions,
-	validateDeletion storage.ValidateObjectFunc, cachedExistingObject runtime.Object) error {
-	getCurrentState := s.getCurrentState(ctx, key, v, false)
+	validateDeletion storage.ValidateObjectFunc, cachedExistingObject runtime.Object, skipTransformDecode bool) error {
+	getCurrentState := s.getCurrentState(ctx, key, v, false, skipTransformDecode)
 
 	var origState *objState
 	var err error
@@ -354,7 +363,7 @@ func (s *store) conditionalDelete(
 		if !txnResp.Succeeded {
 			getResp := (*clientv3.GetResponse)(txnResp.Responses[0].GetResponseRange())
 			klog.V(4).Infof("deletion of %s failed because of a conflict, going to retry", key)
-			origState, err = s.getState(ctx, getResp, key, v, false)
+			origState, err = s.getState(ctx, getResp, key, v, false, skipTransformDecode)
 			if err != nil {
 				return err
 			}
@@ -369,10 +378,12 @@ func (s *store) conditionalDelete(
 		if deleteResp.Header == nil {
 			return errors.New("invalid DeleteRange response - nil header")
 		}
-		err = decode(s.codec, s.versioner, origState.data, out, deleteResp.Header.Revision)
-		if err != nil {
-			recordDecodeError(s.groupResourceString, key)
-			return err
+		if !skipTransformDecode {
+			err = s.decoder.Decode(origState.data, out, deleteResp.Header.Revision)
+			if err != nil {
+				recordDecodeError(s.groupResourceString, key)
+				return err
+			}
 		}
 		return nil
 	}
@@ -398,7 +409,8 @@ func (s *store) GuaranteedUpdate(
 		return fmt.Errorf("unable to convert output object to pointer: %v", err)
 	}
 
-	getCurrentState := s.getCurrentState(ctx, preparedKey, v, ignoreNotFound)
+	skipTransformDecode := false
+	getCurrentState := s.getCurrentState(ctx, preparedKey, v, ignoreNotFound, skipTransformDecode)
 
 	var origState *objState
 	var origStateIsCurrent bool
@@ -484,7 +496,7 @@ func (s *store) GuaranteedUpdate(
 			}
 			// recheck that the data from etcd is not stale before short-circuiting a write
 			if !origState.stale {
-				err = decode(s.codec, s.versioner, origState.data, destination, origState.rev)
+				err = s.decoder.Decode(origState.data, destination, origState.rev)
 				if err != nil {
 					recordDecodeError(s.groupResourceString, preparedKey)
 					return err
@@ -496,7 +508,7 @@ func (s *store) GuaranteedUpdate(
 		newData, err := s.transformer.TransformToStorage(ctx, data, transformContext)
 		if err != nil {
 			span.AddEvent("TransformToStorage failed", attribute.String("err", err.Error()))
-			return storage.NewInternalError(err.Error())
+			return storage.NewInternalError(err)
 		}
 		span.AddEvent("TransformToStorage succeeded")
 
@@ -524,7 +536,8 @@ func (s *store) GuaranteedUpdate(
 		if !txnResp.Succeeded {
 			getResp := (*clientv3.GetResponse)(txnResp.Responses[0].GetResponseRange())
 			klog.V(4).Infof("GuaranteedUpdate of %s failed because of a conflict, going to retry", preparedKey)
-			origState, err = s.getState(ctx, getResp, preparedKey, v, ignoreNotFound)
+			skipTransformDecode := false
+			origState, err = s.getState(ctx, getResp, preparedKey, v, ignoreNotFound, skipTransformDecode)
 			if err != nil {
 				return err
 			}
@@ -534,7 +547,7 @@ func (s *store) GuaranteedUpdate(
 		}
 		putResp := txnResp.Responses[0].GetResponsePut()
 
-		err = decode(s.codec, s.versioner, data, destination, putResp.Header.Revision)
+		err = s.decoder.Decode(data, destination, putResp.Header.Revision)
 		if err != nil {
 			span.AddEvent("decode failed", attribute.Int("len", len(data)), attribute.String("err", err.Error()))
 			recordDecodeError(s.groupResourceString, preparedKey)
@@ -582,6 +595,52 @@ func (s *store) Count(key string) (int64, error) {
 		return 0, err
 	}
 	return getResp.Count, nil
+}
+
+// ReadinessCheck implements storage.Interface.
+func (s *store) ReadinessCheck() error {
+	return nil
+}
+
+// resolveGetListRev is used by GetList to resolve the rev to use in the client.KV.Get request.
+func (s *store) resolveGetListRev(continueKey string, continueRV int64, opts storage.ListOptions) (int64, error) {
+	var withRev int64
+	// Uses continueRV if this is a continuation request.
+	if len(continueKey) > 0 {
+		if len(opts.ResourceVersion) > 0 && opts.ResourceVersion != "0" {
+			return withRev, apierrors.NewBadRequest("specifying resource version is not allowed when using continue")
+		}
+		// If continueRV > 0, the LIST request needs a specific resource version.
+		// continueRV==0 is invalid.
+		// If continueRV < 0, the request is for the latest resource version.
+		if continueRV > 0 {
+			withRev = continueRV
+		}
+		return withRev, nil
+	}
+	// Returns 0 if ResourceVersion is not specified.
+	if len(opts.ResourceVersion) == 0 {
+		return withRev, nil
+	}
+	parsedRV, err := s.versioner.ParseResourceVersion(opts.ResourceVersion)
+	if err != nil {
+		return withRev, apierrors.NewBadRequest(fmt.Sprintf("invalid resource version: %v", err))
+	}
+
+	switch opts.ResourceVersionMatch {
+	case metav1.ResourceVersionMatchNotOlderThan:
+		// The not older than constraint is checked after we get a response from etcd,
+		// and returnedRV is then set to the revision we get from the etcd response.
+	case metav1.ResourceVersionMatchExact:
+		withRev = int64(parsedRV)
+	case "": // legacy case
+		if opts.Recursive && opts.Predicate.Limit > 0 && parsedRV > 0 {
+			withRev = int64(parsedRV)
+		}
+	default:
+		return withRev, fmt.Errorf("unknown ResourceVersionMatch value: %v", opts.ResourceVersionMatch)
+	}
+	return withRev, nil
 }
 
 // GetList implements storage.Interface.
@@ -636,41 +695,15 @@ func (s *store) GetList(ctx context.Context, key string, opts storage.ListOption
 
 	var continueRV, withRev int64
 	var continueKey string
-	switch {
-	case opts.Recursive && len(opts.Predicate.Continue) > 0:
+	if opts.Recursive && len(opts.Predicate.Continue) > 0 {
 		continueKey, continueRV, err = storage.DecodeContinue(opts.Predicate.Continue, keyPrefix)
 		if err != nil {
 			return apierrors.NewBadRequest(fmt.Sprintf("invalid continue token: %v", err))
 		}
-
-		if len(opts.ResourceVersion) > 0 && opts.ResourceVersion != "0" {
-			return apierrors.NewBadRequest("specifying resource version is not allowed when using continue")
-		}
 		preparedKey = continueKey
-		// If continueRV > 0, the LIST request needs a specific resource version.
-		// continueRV==0 is invalid.
-		// If continueRV < 0, the request is for the latest resource version.
-		if continueRV > 0 {
-			withRev = continueRV
-		}
-	case len(opts.ResourceVersion) > 0:
-		parsedRV, err := s.versioner.ParseResourceVersion(opts.ResourceVersion)
-		if err != nil {
-			return apierrors.NewBadRequest(fmt.Sprintf("invalid resource version: %v", err))
-		}
-		switch opts.ResourceVersionMatch {
-		case metav1.ResourceVersionMatchNotOlderThan:
-			// The not older than constraint is checked after we get a response from etcd,
-			// and returnedRV is then set to the revision we get from the etcd response.
-		case metav1.ResourceVersionMatchExact:
-			withRev = int64(parsedRV)
-		case "": // legacy case
-			if opts.Recursive && opts.Predicate.Limit > 0 && parsedRV > 0 {
-				withRev = int64(parsedRV)
-			}
-		default:
-			return fmt.Errorf("unknown ResourceVersionMatch value: %v", opts.ResourceVersionMatch)
-		}
+	}
+	if withRev, err = s.resolveGetListRev(continueKey, continueRV, opts); err != nil {
+		return err
 	}
 
 	if withRev != 0 {
@@ -735,13 +768,28 @@ func (s *store) GetList(ctx context.Context, key string, opts storage.ListOption
 
 			data, _, err := s.transformer.TransformFromStorage(ctx, kv.Value, authenticatedDataString(kv.Key))
 			if err != nil {
-				return storage.NewInternalErrorf("unable to transform key %q: %v", kv.Key, err)
+				return storage.NewInternalError(fmt.Errorf("unable to transform key %q: %w", kv.Key, err))
 			}
 
-			if err := appendListItem(v, data, uint64(kv.ModRevision), opts.Predicate, s.codec, s.versioner, newItemFunc); err != nil {
+			// Check if the request has already timed out before decode object
+			select {
+			case <-ctx.Done():
+				// parent context is canceled or timed out, no point in continuing
+				return storage.NewTimeoutError(string(kv.Key), "request did not complete within requested timeout")
+			default:
+			}
+
+			obj, err := s.decoder.DecodeListItem(ctx, data, uint64(kv.ModRevision), newItemFunc)
+			if err != nil {
 				recordDecodeError(s.groupResourceString, string(kv.Key))
 				return err
 			}
+
+			// being unable to set the version does not prevent the object from being extracted
+			if matched, err := opts.Predicate.Matches(obj); err == nil && matched {
+				v.Set(reflect.Append(v, reflect.ValueOf(obj).Elem()))
+			}
+
 			numEvald++
 
 			// free kv early. Long lists can take O(seconds) to decode.
@@ -774,27 +822,11 @@ func (s *store) GetList(ctx context.Context, key string, opts storage.ListOption
 		v.Set(reflect.MakeSlice(v.Type(), 0, 0))
 	}
 
-	// instruct the client to begin querying from immediately after the last key we returned
-	// we never return a key that the client wouldn't be allowed to see
-	if hasMore {
-		// we want to start immediately after the last key
-		next, err := storage.EncodeContinue(string(lastKey)+"\x00", keyPrefix, withRev)
-		if err != nil {
-			return err
-		}
-		var remainingItemCount *int64
-		// getResp.Count counts in objects that do not match the pred.
-		// Instead of returning inaccurate count for non-empty selectors, we return nil.
-		// Only set remainingItemCount if the predicate is empty.
-		if opts.Predicate.Empty() {
-			c := int64(getResp.Count - opts.Predicate.Limit)
-			remainingItemCount = &c
-		}
-		return s.versioner.UpdateList(listObj, uint64(withRev), next, remainingItemCount)
+	continueValue, remainingItemCount, err := storage.PrepareContinueToken(string(lastKey), keyPrefix, withRev, getResp.Count, hasMore, opts)
+	if err != nil {
+		return err
 	}
-
-	// no continuation
-	return s.versioner.UpdateList(listObj, uint64(withRev), "", nil)
+	return s.versioner.UpdateList(listObj, uint64(withRev), continueValue, remainingItemCount)
 }
 
 // growSlice takes a slice value and grows its capacity up
@@ -852,7 +884,7 @@ func (s *store) watchContext(ctx context.Context) context.Context {
 	return clientv3.WithRequireLeader(ctx)
 }
 
-func (s *store) getCurrentState(ctx context.Context, key string, v reflect.Value, ignoreNotFound bool) func() (*objState, error) {
+func (s *store) getCurrentState(ctx context.Context, key string, v reflect.Value, ignoreNotFound bool, skipTransformDecode bool) func() (*objState, error) {
 	return func() (*objState, error) {
 		startTime := time.Now()
 		getResp, err := s.client.KV.Get(ctx, key)
@@ -860,11 +892,17 @@ func (s *store) getCurrentState(ctx context.Context, key string, v reflect.Value
 		if err != nil {
 			return nil, err
 		}
-		return s.getState(ctx, getResp, key, v, ignoreNotFound)
+		return s.getState(ctx, getResp, key, v, ignoreNotFound, skipTransformDecode)
 	}
 }
 
-func (s *store) getState(ctx context.Context, getResp *clientv3.GetResponse, key string, v reflect.Value, ignoreNotFound bool) (*objState, error) {
+// getState constructs a new objState from the given response from the storage.
+// skipTransformDecode: if true, the function will neither transform the data
+// from the storage nor decode it into an object; otherwise, data from the
+// storage will be transformed and decoded.
+// NOTE: when skipTransformDecode is true, the 'data', and the 'obj' fields
+// of the objState will be nil, and 'stale' will be set to true.
+func (s *store) getState(ctx context.Context, getResp *clientv3.GetResponse, key string, v reflect.Value, ignoreNotFound bool, skipTransformDecode bool) (*objState, error) {
 	state := &objState{
 		meta: &storage.ResponseMeta{},
 	}
@@ -883,15 +921,25 @@ func (s *store) getState(ctx context.Context, getResp *clientv3.GetResponse, key
 			return nil, err
 		}
 	} else {
-		data, stale, err := s.transformer.TransformFromStorage(ctx, getResp.Kvs[0].Value, authenticatedDataString(key))
-		if err != nil {
-			return nil, storage.NewInternalError(err.Error())
-		}
 		state.rev = getResp.Kvs[0].ModRevision
 		state.meta.ResourceVersion = uint64(state.rev)
+
+		if skipTransformDecode {
+			// be explicit that we don't have the object
+			state.obj = nil
+			state.stale = true // this seems a more sane value here
+			return state, nil
+		}
+
+		data, stale, err := s.transformer.TransformFromStorage(ctx, getResp.Kvs[0].Value, authenticatedDataString(key))
+		if err != nil {
+			return nil, storage.NewInternalError(err)
+		}
+
 		state.data = data
 		state.stale = stale
-		if err := decode(s.codec, s.versioner, state.data, state.obj, state.rev); err != nil {
+
+		if err := s.decoder.Decode(state.data, state.obj, state.rev); err != nil {
 			recordDecodeError(s.groupResourceString, key)
 			return nil, err
 		}
@@ -996,39 +1044,6 @@ func (s *store) prepareKey(key string) (string, error) {
 		startIndex = 1
 	}
 	return s.pathPrefix + key[startIndex:], nil
-}
-
-// decode decodes value of bytes into object. It will also set the object resource version to rev.
-// On success, objPtr would be set to the object.
-func decode(codec runtime.Codec, versioner storage.Versioner, value []byte, objPtr runtime.Object, rev int64) error {
-	if _, err := conversion.EnforcePtr(objPtr); err != nil {
-		return fmt.Errorf("unable to convert output object to pointer: %v", err)
-	}
-	_, _, err := codec.Decode(value, nil, objPtr)
-	if err != nil {
-		return err
-	}
-	// being unable to set the version does not prevent the object from being extracted
-	if err := versioner.UpdateObject(objPtr, uint64(rev)); err != nil {
-		klog.Errorf("failed to update object version: %v", err)
-	}
-	return nil
-}
-
-// appendListItem decodes and appends the object (if it passes filter) to v, which must be a slice.
-func appendListItem(v reflect.Value, data []byte, rev uint64, pred storage.SelectionPredicate, codec runtime.Codec, versioner storage.Versioner, newItemFunc func() runtime.Object) error {
-	obj, _, err := codec.Decode(data, nil, newItemFunc())
-	if err != nil {
-		return err
-	}
-	// being unable to set the version does not prevent the object from being extracted
-	if err := versioner.UpdateObject(obj, rev); err != nil {
-		klog.Errorf("failed to update object version: %v", err)
-	}
-	if matched, err := pred.Matches(obj); err == nil && matched {
-		v.Set(reflect.Append(v, reflect.ValueOf(obj).Elem()))
-	}
-	return nil
 }
 
 // recordDecodeError record decode error split by object type.
